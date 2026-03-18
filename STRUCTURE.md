@@ -11,7 +11,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                      bot.py                                 │
 │                                                             │
-│  Telegram Bot (polling)  +  HTTP API (:5000)                │
+│  Telegram Bot (polling)  +  HTTP API (:BOT_PORT)            │
 │                                                             │
 │  ┌─────────────┐  ┌──────────────┐  ┌───────────────────┐  │
 │  │ handle_msg  │  │ http_session │  │ watch_transcript  │  │

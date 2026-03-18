@@ -3,6 +3,9 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# 项目内部文档（不需要提交）
 PLAN.md
+ROADMAP.md
 TECHNICAL_RESEARCH.md
 CLAUDE.md

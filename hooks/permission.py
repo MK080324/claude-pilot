@@ -9,7 +9,18 @@ import os
 import json
 import urllib.request
 
-BOT_API = "http://localhost:5000/permission"
+def _read_bot_port():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("BOT_PORT="):
+                    return line.split("=", 1)[1].strip()
+    return os.environ.get("BOT_PORT", "5000")
+
+BOT_PORT = _read_bot_port()
+BOT_API = f"http://localhost:{BOT_PORT}/permission"
 
 # 从 stdin 读取 Claude 传来的 Hook 数据
 input_data = json.loads(sys.stdin.read())

@@ -9,7 +9,18 @@ import os
 import json
 import urllib.request
 
-BOT_API = "http://localhost:5000/session_start"
+def _read_bot_port():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("BOT_PORT="):
+                    return line.split("=", 1)[1].strip()
+    return os.environ.get("BOT_PORT", "5000")
+
+BOT_PORT = _read_bot_port()
+BOT_API = f"http://localhost:{BOT_PORT}/session_start"
 
 # 如果是 Bot 启动的 Claude，不需要通知（Bot 自己处理流式输出）
 if os.environ.get("TELEGRAM_CHAT_ID"):

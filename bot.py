@@ -121,19 +121,30 @@ _tg_markdown = mistune.create_markdown(
     plugins=["strikethrough", "table"],
 )
 
-# 从 .env 文件读取 Token
+# ============ 配置加载 ============
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 def load_env():
-    with open(".env") as f:
+    env_path = os.path.join(BASE_DIR, ".env")
+    if not os.path.exists(env_path):
+        print(f"⚠️  未找到 {env_path}，请复制 .env.example 为 .env 并填入配置")
+        return
+    with open(env_path) as f:
         for line in f:
             line = line.strip()
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
-                os.environ[key.strip()] = value.strip()
+                key = key.strip()
+                if key not in os.environ:
+                    os.environ[key] = value.strip()
 
 load_env()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ALLOWED_USERS = [int(x) for x in os.environ["ALLOWED_USERS"].split(",")]
-DEFAULT_PROJECT_DIR = os.path.expanduser("~/workspace")
+BOT_PORT = int(os.environ.get("BOT_PORT", "5000"))
+DEFAULT_PROJECT_DIR = os.path.expanduser(os.environ.get("PROJECT_DIR", "~/workspace"))
+CLAUDE_PROJECTS_DIR = os.path.expanduser(os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects"))
 
 # ============ 全局状态 ============
 
@@ -265,10 +276,9 @@ def resolve_topic(data):
 
 async def show_context(chat_id, topic_id, session_id):
     """读取 JSONL 文件，在话题中显示会话历史"""
-    claude_projects = os.path.expanduser("~/.claude/projects")
     transcript_path = None
-    for pdir in os.listdir(claude_projects):
-        fpath = os.path.join(claude_projects, pdir, f"{session_id}.jsonl")
+    for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+        fpath = os.path.join(CLAUDE_PROJECTS_DIR, pdir, f"{session_id}.jsonl")
         if os.path.exists(fpath):
             transcript_path = fpath
             break
@@ -436,9 +446,8 @@ async def handle_button(update: Update, context):
         thread_id = query.message.message_thread_id or 0
         project_dir = DEFAULT_PROJECT_DIR
         custom_title = ""
-        claude_projects = os.path.expanduser("~/.claude/projects")
-        for pdir in os.listdir(claude_projects):
-            fpath = os.path.join(claude_projects, pdir, f"{session_id}.jsonl")
+        for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+            fpath = os.path.join(CLAUDE_PROJECTS_DIR, pdir, f"{session_id}.jsonl")
             if os.path.exists(fpath):
                 try:
                     with open(fpath, "r") as f:
@@ -685,11 +694,10 @@ async def cmd_projects(update: Update, context):
 async def cmd_resume(update: Update, context):
     if update.effective_user.id not in ALLOWED_USERS:
         return
-    claude_projects = os.path.expanduser("~/.claude/projects")
     all_sessions = []
     try:
-        for pdir in os.listdir(claude_projects):
-            full_dir = os.path.join(claude_projects, pdir)
+        for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+            full_dir = os.path.join(CLAUDE_PROJECTS_DIR, pdir)
             if not os.path.isdir(full_dir):
                 continue
             for fname in os.listdir(full_dir):
@@ -998,10 +1006,10 @@ async def main():
     http_app.router.add_get("/health", http_health)
     runner = web.AppRunner(http_app)
     await runner.setup()
-    site = web.TCPSite(runner, "localhost", 5000)
+    site = web.TCPSite(runner, "localhost", BOT_PORT)
 
     print("Bot 已启动，等待消息...")
-    print("HTTP API 运行在 http://localhost:5000")
+    print(f"HTTP API 运行在 http://localhost:{BOT_PORT}")
     await tg_app.initialize()
     await tg_app.start()
 
