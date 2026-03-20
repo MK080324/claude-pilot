@@ -1271,13 +1271,21 @@ async def main():
     await tg_app.updater.start_polling()
     await site.start()
 
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+
     try:
-        await asyncio.Event().wait()
+        await stop_event.wait()
     finally:
+        print("\n正在退出中...")
         await tg_app.updater.stop()
         await tg_app.stop()
         await tg_app.shutdown()
         await runner.cleanup()
+        print("已退出")
 
 if __name__ == "__main__":
+    import signal
     asyncio.run(main())
