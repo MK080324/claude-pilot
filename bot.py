@@ -155,7 +155,6 @@ permission_enabled = True  # 权限审批开关
 sessions = {}              # topic_id → session info
 session_topics = {}        # session_id → topic_id（反向映射）
 pending_permissions = {}   # 权限请求存储
-cleared_sessions = set()   # 已清除的会话（不显示在 /resume 中）
 tmux_locks = {}            # tmux_pane → asyncio.Lock（防止并发注入交叉）
 
 # ============ 工具函数 ============
@@ -443,23 +442,46 @@ async def handle_button(update: Update, context):
     # 恢复会话: resume:session_id
     if data.startswith("resume:"):
         session_id = data[7:]
+        # 拦截已绑定的会话
+        if session_id in session_topics:
+            await query.edit_message_text("❌ 该会话已绑定话题，暂无法恢复。")
+            await query.answer()
+            return
         thread_id = query.message.message_thread_id or 0
         project_dir = DEFAULT_PROJECT_DIR
         custom_title = ""
+        # 找到 JSONL 文件，只读头部取 cwd，读尾部取 custom-title
         for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
             fpath = os.path.join(CLAUDE_PROJECTS_DIR, pdir, f"{session_id}.jsonl")
             if os.path.exists(fpath):
                 try:
+                    # 头部取 cwd
                     with open(fpath, "r") as f:
-                        for line in f:
-                            try:
-                                obj = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
+                        head = f.read(8192)
+                    for line in head.split("\n"):
+                        try:
+                            obj = json.loads(line)
                             if obj.get("cwd"):
                                 project_dir = obj["cwd"]
+                                break
+                        except json.JSONDecodeError:
+                            continue
+                    # 尾部取 custom-title
+                    file_size = os.path.getsize(fpath)
+                    tail_size = min(4096, file_size)
+                    with open(fpath, "rb") as f:
+                        f.seek(max(0, file_size - tail_size))
+                        tail = f.read().decode("utf-8", errors="ignore")
+                    for line in reversed(tail.split("\n")):
+                        if '"custom-title"' not in line:
+                            continue
+                        try:
+                            obj = json.loads(line)
                             if obj.get("type") == "custom-title":
                                 custom_title = obj.get("customTitle", "")
+                                break
+                        except json.JSONDecodeError:
+                            continue
                 except Exception:
                     pass
                 break
@@ -470,9 +492,8 @@ async def handle_button(update: Update, context):
             "source": "telegram",
         }
         session_topics[session_id] = thread_id
-        project_name = os.path.basename(project_dir)
-        display_name = custom_title or project_name
-        await query.edit_message_text(f"✅ 已恢复会话\n📁 {display_name}\n🆔 {session_id[:8]}...")
+        display_name = custom_title or "未命名对话"
+        await query.edit_message_text(f"✅ 已恢复会话\n📛 {display_name}\n🆔 {session_id[:8]}...")
         await query.answer()
         # 自动改话题名
         chat_id = query.message.chat.id
@@ -486,6 +507,41 @@ async def handle_button(update: Update, context):
             except Exception as e:
                 print(f"[Resume] 修改话题名失败: {e}")
         await show_context(query.message.chat.id, thread_id, session_id)
+        return
+
+    # 删除确认: delete_yes:session_id / delete_no:session_id
+    if data.startswith("delete_yes:"):
+        sid = data[11:]
+        # 断开话题绑定
+        topic_id_to_clear = session_topics.pop(sid, None)
+        if topic_id_to_clear is not None:
+            s = sessions.pop(topic_id_to_clear, None)
+            if s and s.get("watcher_task"):
+                s["watcher_task"].cancel()
+        # 删除 JSONL 文件
+        deleted = False
+        for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+            fpath = os.path.join(CLAUDE_PROJECTS_DIR, pdir, f"{sid}.jsonl")
+            if os.path.exists(fpath):
+                os.remove(fpath)
+                deleted = True
+                break
+        # 关闭话题
+        chat_id = query.message.chat.id
+        thread_id = query.message.message_thread_id
+        if thread_id and chat_id:
+            try:
+                await tg_app.bot.close_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
+            except Exception:
+                pass
+        status = "文件已删除" if deleted else "文件未找到，但已断开绑定"
+        await query.edit_message_text(f"🗑️ 会话已删除 ({sid[:8]}...)\n{status}\n请删除当前话题，当前话题已不可继续对话。")
+        await query.answer()
+        return
+
+    if data.startswith("delete_no:"):
+        await query.edit_message_text("已取消删除")
+        await query.answer()
         return
 
     # 权限按钮: allow:xxx / deny:xxx
@@ -649,8 +705,9 @@ async def cmd_start(update: Update, context):
         "/projects - 选择项目目录\n"
         "/resume - 恢复历史会话\n"
         "/rename - 重命名当前会话\n"
+        "/interrupt - 中断 Claude 回复\n"
         "/quit - 暂停当前会话\n"
-        "/clear - 清除当前会话\n"
+        "/delete - 删除对话（不可恢复）\n"
         "/info - 查看会话信息\n"
         "/bypass - 切换权限审批\n"
         "/setdir - 手动设置项目目录"
@@ -691,65 +748,133 @@ async def cmd_projects(update: Update, context):
         buttons.append(row)
     await update.message.reply_text("选择项目目录:", reply_markup=InlineKeyboardMarkup(buttons))
 
+def _scan_sessions():
+    """扫描所有 JSONL 文件，只读尾部 4KB 获取 custom-title。返回会话列表。"""
+    results = []
+    for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+        full_dir = os.path.join(CLAUDE_PROJECTS_DIR, pdir)
+        if not os.path.isdir(full_dir):
+            continue
+        for fname in os.listdir(full_dir):
+            if not fname.endswith(".jsonl"):
+                continue
+            fpath = os.path.join(full_dir, fname)
+            session_id = fname[:-6]
+            try:
+                title = ""
+                file_size = os.path.getsize(fpath)
+                tail_size = min(4096, file_size)
+                with open(fpath, "rb") as f:
+                    f.seek(max(0, file_size - tail_size))
+                    tail = f.read().decode("utf-8", errors="ignore")
+                for line in reversed(tail.split("\n")):
+                    if '"custom-title"' not in line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("type") == "custom-title":
+                            title = obj.get("customTitle", "")
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                results.append({
+                    "session_id": session_id,
+                    "title": title,
+                    "path": fpath,
+                    "mtime": os.path.getmtime(fpath),
+                })
+            except Exception:
+                continue
+    return results
+
 async def cmd_resume(update: Update, context):
     if update.effective_user.id not in ALLOWED_USERS:
         return
-    all_sessions = []
     try:
-        for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
-            full_dir = os.path.join(CLAUDE_PROJECTS_DIR, pdir)
-            if not os.path.isdir(full_dir):
-                continue
-            for fname in os.listdir(full_dir):
-                if not fname.endswith(".jsonl"):
-                    continue
-                fpath = os.path.join(full_dir, fname)
-                session_id = fname[:-6]
-                if session_id in cleared_sessions:
-                    continue
-                if session_id in session_topics:
-                    continue
-                try:
-                    cwd = "?"
-                    slug = ""
-                    title = ""
-                    with open(fpath, "r") as f:
-                        for line in f:
-                            try:
-                                obj = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if obj.get("type") == "custom-title":
-                                title = obj.get("customTitle", "")
-                            if cwd == "?" and obj.get("cwd"):
-                                cwd = obj["cwd"]
-                            if not slug and obj.get("slug"):
-                                slug = obj["slug"]
-                    all_sessions.append({
-                        "session_id": session_id,
-                        "cwd": cwd,
-                        "slug": slug,
-                        "title": title,
-                        "mtime": os.path.getmtime(fpath),
-                    })
-                except Exception:
-                    continue
+        all_sessions = _scan_sessions()
     except OSError:
         await update.message.reply_text("无法读取会话目录")
         return
 
+    # 标记已绑定的会话，但不过滤掉
+    bound_sids = set(session_topics.keys())
     all_sessions.sort(key=lambda x: x["mtime"], reverse=True)
+
+    query_str = " ".join(context.args) if context.args else ""
+
+    if query_str:
+        # 按 ID 前缀或名称模糊匹配（排除已绑定的）
+        matches = []
+        for s in all_sessions:
+            if s["session_id"] in bound_sids:
+                continue
+            if s["session_id"] == query_str or s["session_id"].startswith(query_str):
+                matches.append(s)
+            elif s["title"] and query_str.lower() in s["title"].lower():
+                matches.append(s)
+        if not matches:
+            await update.message.reply_text(f"未找到匹配的会话: {query_str}")
+            return
+        if len(matches) == 1:
+            # 直接恢复
+            target = matches[0]
+            topic_id = get_topic_id(update)
+            project_dir = DEFAULT_PROJECT_DIR
+            # 从头部读取 cwd
+            try:
+                with open(target["path"], "r") as f:
+                    head = f.read(8192)
+                for line in head.split("\n"):
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("cwd"):
+                            project_dir = obj["cwd"]
+                            break
+                    except json.JSONDecodeError:
+                        continue
+            except Exception:
+                pass
+            sid = target["session_id"]
+            sessions[topic_id] = {
+                "session_id": sid,
+                "project_dir": project_dir,
+                "chat_id": update.effective_chat.id,
+                "source": "telegram",
+            }
+            session_topics[sid] = topic_id
+            display = target["title"] or "未命名对话"
+            await update.message.reply_text(f"✅ 已恢复会话\n📛 {display}\n🆔 {sid[:8]}...")
+            if target["title"] and topic_id:
+                try:
+                    await tg_app.bot.edit_forum_topic(
+                        chat_id=update.effective_chat.id,
+                        message_thread_id=topic_id,
+                        name=target["title"][:128],
+                    )
+                except Exception:
+                    pass
+            await show_context(update.effective_chat.id, topic_id, sid)
+            return
+        # 多个匹配，提示用户精确指定
+        lines = [f"找到 {len(matches)} 个匹配，请更精确地指定:"]
+        for m in matches[:8]:
+            label = m["title"] or "未命名对话"
+            lines.append(f"  - {label} ({m['session_id'][:8]}...)")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # 无参数：显示按钮列表（最多 5 条）
     if not all_sessions:
         await update.message.reply_text("没有找到可恢复的会话")
         return
 
     buttons = []
-    for s in all_sessions[:8]:
+    for s in all_sessions[:5]:
+        is_bound = s["session_id"] in bound_sids
         if s["title"]:
-            label = s["title"][:30]
+            label = s["title"][:30] + ("（已绑定话题）" if is_bound else "")
         else:
-            project_name = os.path.basename(s["cwd"])
-            label = f"{project_name} | {s['slug'][:15]}" if s["slug"] else project_name
+            label = "未命名对话" + ("（已绑定话题）" if is_bound else "")
         buttons.append([InlineKeyboardButton(label, callback_data=f"resume:{s['session_id']}")])
     await update.message.reply_text("选择要恢复的会话:", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -768,26 +893,78 @@ async def cmd_quit(update: Update, context):
     del sessions[topic_id]
     await update.message.reply_text(f"⏸️ 会话已暂停 ({session_id[:8]}...)\n用 /resume 可以恢复")
 
-async def cmd_clear(update: Update, context):
+async def cmd_delete(update: Update, context):
+    """删除对话：/delete <会话ID或自定义名称>"""
     if update.effective_user.id not in ALLOWED_USERS:
         return
-    topic_id = get_topic_id(update)
-    session = sessions.get(topic_id)
-    if not session or not session.get("session_id"):
-        await update.message.reply_text("当前话题没有活跃会话")
+    if not context.args:
+        await update.message.reply_text("用法: /delete <会话ID 或 自定义名称>")
         return
-    session_id = session["session_id"]
-    if session.get("watcher_task"):
-        session["watcher_task"].cancel()
-    session_topics.pop(session_id, None)
-    cleared_sessions.add(session_id)
-    del sessions[topic_id]
-    await update.message.reply_text(f"🗑️ 会话已清除 ({session_id[:8]}...)")
-    if topic_id and GROUP_CHAT_ID:
-        try:
-            await tg_app.bot.close_forum_topic(chat_id=GROUP_CHAT_ID, message_thread_id=topic_id)
-        except Exception:
-            pass
+    query_str = " ".join(context.args)
+
+    # 搜索匹配的 JSONL 文件
+    matches = []
+    try:
+        for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+            full_dir = os.path.join(CLAUDE_PROJECTS_DIR, pdir)
+            if not os.path.isdir(full_dir):
+                continue
+            for fname in os.listdir(full_dir):
+                if not fname.endswith(".jsonl"):
+                    continue
+                fpath = os.path.join(full_dir, fname)
+                session_id = fname[:-6]
+                # 精确匹配 session_id
+                if session_id == query_str or session_id.startswith(query_str):
+                    matches.append({"session_id": session_id, "path": fpath, "match": "id"})
+                    continue
+                # 匹配 custom-title（读尾部）
+                try:
+                    file_size = os.path.getsize(fpath)
+                    tail_size = min(4096, file_size)
+                    with open(fpath, "rb") as f:
+                        f.seek(max(0, file_size - tail_size))
+                        tail = f.read().decode("utf-8", errors="ignore")
+                    for line in reversed(tail.split("\n")):
+                        if '"custom-title"' not in line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if obj.get("type") == "custom-title" and query_str in obj.get("customTitle", ""):
+                                matches.append({"session_id": session_id, "path": fpath, "match": obj["customTitle"]})
+                                break
+                        except json.JSONDecodeError:
+                            continue
+                except Exception:
+                    continue
+    except OSError:
+        await update.message.reply_text("无法读取会话目录")
+        return
+
+    if not matches:
+        await update.message.reply_text(f"未找到匹配的会话: {query_str}")
+        return
+    if len(matches) > 1:
+        lines = [f"找到 {len(matches)} 个匹配，请更精确地指定:"]
+        for m in matches[:5]:
+            label = m["match"] if m["match"] != "id" else m["session_id"][:16]
+            lines.append(f"  - {label} ({m['session_id'][:8]}...)")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    target = matches[0]
+    sid = target["session_id"]
+    label = target["match"] if target["match"] != "id" else sid[:16]
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 确认删除", callback_data=f"delete_yes:{sid}"),
+            InlineKeyboardButton("❌ 取消", callback_data=f"delete_no:{sid}"),
+        ]
+    ])
+    await update.message.reply_text(
+        f"⚠️ 确认删除会话?\n🆔 {sid[:16]}...\n📛 {label}\n\n此操作不可恢复！",
+        reply_markup=keyboard,
+    )
 
 async def cmd_rename(update: Update, context):
     if update.effective_user.id not in ALLOWED_USERS:
@@ -1047,7 +1224,7 @@ async def main():
     tg_app.add_handler(CommandHandler("projects", cmd_projects))
     tg_app.add_handler(CommandHandler("resume", cmd_resume))
     tg_app.add_handler(CommandHandler("quit", cmd_quit))
-    tg_app.add_handler(CommandHandler("clear", cmd_clear))
+    tg_app.add_handler(CommandHandler("delete", cmd_delete))
     tg_app.add_handler(CommandHandler("rename", cmd_rename))
     tg_app.add_handler(CommandHandler("interrupt", cmd_interrupt))
     tg_app.add_handler(CommandHandler("setdir", cmd_setdir))
@@ -1078,7 +1255,7 @@ async def main():
         BotCommand("rename", "重命名当前会话"),
         BotCommand("interrupt", "中断 Claude 回复"),
         BotCommand("quit", "暂停当前会话"),
-        BotCommand("clear", "清除当前会话"),
+        BotCommand("delete", "删除对话（不可恢复）"),
         BotCommand("info", "查看会话信息"),
         BotCommand("bypass", "切换权限审批"),
         BotCommand("setdir", "手动设置项目目录"),
