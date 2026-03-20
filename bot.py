@@ -803,13 +803,19 @@ async def cmd_rename(update: Update, context):
     new_name = " ".join(context.args)
     session_id = session["session_id"]
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", "--resume", session_id, "--name", new_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=session.get("project_dir", DEFAULT_PROJECT_DIR),
-        )
-        await proc.communicate()
+        # 找到对应的 JSONL 文件并追加 custom-title 事件
+        jsonl_path = None
+        for pdir in os.listdir(CLAUDE_PROJECTS_DIR):
+            fpath = os.path.join(CLAUDE_PROJECTS_DIR, pdir, f"{session_id}.jsonl")
+            if os.path.exists(fpath):
+                jsonl_path = fpath
+                break
+        if not jsonl_path:
+            await update.message.reply_text("❌ 找不到会话文件，无法重命名")
+            return
+        event = {"type": "custom-title", "customTitle": new_name, "sessionId": session_id}
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps(event) + "\n")
         # 同步修改 TG 话题名称
         if topic_id:
             try:
@@ -823,6 +829,53 @@ async def cmd_rename(update: Update, context):
         await update.message.reply_text(f"✅ 会话已重命名为: {new_name}")
     except Exception as e:
         await update.message.reply_text(f"❌ 重命名失败: {e}")
+
+async def cmd_interrupt(update: Update, context):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    topic_id = get_topic_id(update)
+    session = sessions.get(topic_id)
+    if not session or not session.get("session_id"):
+        await update.message.reply_text("当前话题没有活跃会话")
+        return
+
+    source = session.get("source")
+
+    # 终端会话：通过 tmux 发送 Escape 中断
+    if source == "terminal":
+        tmux_pane = session.get("tmux_pane")
+        if not tmux_pane:
+            await update.message.reply_text("⚠️ 该终端会话未在 tmux 中运行，无法中断")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "send-keys", "-t", tmux_pane, "Escape",
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                await update.message.reply_text(f"❌ 中断失败: {stderr.decode()}")
+                return
+            await update.message.reply_text("✅ 已发送中断信号到终端")
+        except Exception as e:
+            await update.message.reply_text(f"❌ 中断失败: {e}")
+        return
+
+    # TG 会话：向子进程发送 SIGINT
+    if source == "telegram":
+        proc = session.get("proc")
+        if not proc or proc.returncode is not None:
+            await update.message.reply_text("当前没有正在运行的 Claude 进程")
+            return
+        try:
+            import signal
+            proc.send_signal(signal.SIGINT)
+            await update.message.reply_text("✅ 已中断 Claude 回复")
+        except Exception as e:
+            await update.message.reply_text(f"❌ 中断失败: {e}")
+        return
+
+    await update.message.reply_text("⚠️ 无法识别当前会话类型")
 
 async def cmd_setdir(update: Update, context):
     if update.effective_user.id not in ALLOWED_USERS:
@@ -926,6 +979,7 @@ async def handle_message(update: Update, context):
             cwd=session["project_dir"],
             env=env,
         )
+        session["proc"] = proc
 
         turn_count = 0
         async for raw_line in proc.stdout:
@@ -976,8 +1030,10 @@ async def handle_message(update: Update, context):
                     await update.message.reply_text(f"❌ 出错了: {event.get('result', '未知错误')}")
 
         await proc.wait()
+        session.pop("proc", None)
 
     except Exception as e:
+        session.pop("proc", None)
         await update.message.reply_text(f"❌ 出错了: {str(e)}")
 
 # ============ 启动 ============
@@ -993,6 +1049,7 @@ async def main():
     tg_app.add_handler(CommandHandler("quit", cmd_quit))
     tg_app.add_handler(CommandHandler("clear", cmd_clear))
     tg_app.add_handler(CommandHandler("rename", cmd_rename))
+    tg_app.add_handler(CommandHandler("interrupt", cmd_interrupt))
     tg_app.add_handler(CommandHandler("setdir", cmd_setdir))
     tg_app.add_handler(CommandHandler("info", cmd_info))
     tg_app.add_handler(CallbackQueryHandler(handle_button))
@@ -1019,6 +1076,7 @@ async def main():
         BotCommand("projects", "选择项目目录"),
         BotCommand("resume", "恢复历史会话"),
         BotCommand("rename", "重命名当前会话"),
+        BotCommand("interrupt", "中断 Claude 回复"),
         BotCommand("quit", "暂停当前会话"),
         BotCommand("clear", "清除当前会话"),
         BotCommand("info", "查看会话信息"),
