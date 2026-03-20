@@ -790,6 +790,13 @@ def _scan_sessions():
 async def cmd_resume(update: Update, context):
     if update.effective_user.id not in ALLOWED_USERS:
         return
+    topic_id = get_topic_id(update)
+    if topic_id in sessions and sessions[topic_id].get("session_id"):
+        await update.message.reply_text(
+            "当前话题已绑定对话，请执行 /quit 解除绑定后再继续。\n"
+            "详细状态信息请输入 /info 查看"
+        )
+        return
     try:
         all_sessions = _scan_sessions()
     except OSError:
