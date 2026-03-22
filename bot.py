@@ -426,12 +426,19 @@ async def process_transcript_event(event, chat_id, topic_id):
 
         if isinstance(content, str):
             if content.strip():
+                # 记录最后一条 assistant 文本，供 /retry 使用
+                session = sessions.get(topic_id)
+                if session:
+                    session["last_result"] = content
                 await send_to_topic(chat_id, topic_id, content, markdown=True)
         elif isinstance(content, list):
             for block in content:
                 if block.get("type") == "text":
                     text = block.get("text", "")
                     if text.strip():
+                        session = sessions.get(topic_id)
+                        if session:
+                            session["last_result"] = text
                         await send_to_topic(chat_id, topic_id, text, markdown=True)
                 elif block.get("type") == "tool_use":
                     name = block.get("name", "?")
@@ -749,6 +756,7 @@ async def cmd_start(update: Update, context):
         "/quit - 暂停当前会话\n"
         "/delete - 删除对话（不可恢复）\n"
         "/info - 查看会话信息\n"
+        "/retry - 重发 Claude 最后一条回复\n"
         "/bypass - 切换权限审批\n"
         "/setdir - 手动设置项目目录"
     )
@@ -1141,6 +1149,20 @@ async def cmd_info(update: Update, context):
         f"bypass: {bypass}"
     )
 
+async def cmd_retry(update: Update, context):
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    topic_id = get_topic_id(update)
+    session = sessions.get(topic_id)
+    if not session or not session.get("last_result"):
+        await update.message.reply_text("没有可重发的消息")
+        return
+    text = session["last_result"]
+    if session.get("source") == "terminal":
+        await send_to_topic(session["chat_id"], topic_id, text, markdown=True)
+    else:
+        await send_reply(update, text, markdown=True)
+
 # ============ 消息处理（TG 会话 stream-json） ============
 
 async def handle_message(update: Update, context):
@@ -1253,6 +1275,7 @@ async def _handle_tg_session(update, context, topic_id, session, text):
                     if block.get("type") == "text":
                         reply_text = block["text"]
                         if reply_text.strip():
+                            session["last_result"] = reply_text
                             await send_reply(update, reply_text, markdown=True)
                     elif block.get("type") == "tool_use":
                         tool_name = block.get("name", "?")
@@ -1293,6 +1316,7 @@ async def main():
     tg_app.add_handler(CommandHandler("interrupt", cmd_interrupt))
     tg_app.add_handler(CommandHandler("setdir", cmd_setdir))
     tg_app.add_handler(CommandHandler("info", cmd_info))
+    tg_app.add_handler(CommandHandler("retry", cmd_retry))
     tg_app.add_handler(CallbackQueryHandler(handle_button))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1321,6 +1345,7 @@ async def main():
         BotCommand("quit", "暂停当前会话"),
         BotCommand("delete", "删除对话（不可恢复）"),
         BotCommand("info", "查看会话信息"),
+        BotCommand("retry", "重发 Claude 最后一条回复"),
         BotCommand("bypass", "切换权限审批"),
         BotCommand("setdir", "手动设置项目目录"),
     ])
