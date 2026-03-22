@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import signal
 import uuid
 import html as html_lib
 import mistune
@@ -156,6 +157,7 @@ sessions = {}              # topic_id → session info
 session_topics = {}        # session_id → topic_id（反向映射）
 pending_permissions = {}   # 权限请求存储
 tmux_locks = {}            # tmux_pane → asyncio.Lock（防止并发注入交叉）
+topic_locks = {}           # topic_id → asyncio.Lock（防止 TG 会话并发启动多个 claude -p）
 
 # ============ 工具函数 ============
 
@@ -172,35 +174,73 @@ def gfm_to_html(text):
         result = result.replace("\n\n\n", "\n\n")
     return result.strip()
 
+def _split_html_chunks(text, limit=4096):
+    """先将 Markdown 整体转为 HTML，再在段落边界处分段，确保每段 HTML 不超过 limit。
+    返回 (html_chunk, raw_chunk) 元组列表，raw_chunk 用于 fallback。"""
+    html_full = gfm_to_html(text)
+
+    # 短文本直接返回
+    if len(html_full) <= limit:
+        return [(html_full, text)]
+
+    # 按双换行拆分原始 Markdown 为段落块，逐块转 HTML 并累积
+    blocks = text.split("\n\n")
+    results = []
+    cur_md = ""
+    cur_html = ""
+
+    for block in blocks:
+        candidate_md = (cur_md + "\n\n" + block) if cur_md else block
+        candidate_html = gfm_to_html(candidate_md)
+
+        if len(candidate_html) <= limit:
+            cur_md = candidate_md
+            cur_html = candidate_html
+        else:
+            # 累积的内容先保存
+            if cur_html:
+                results.append((cur_html, cur_md))
+
+            # 单个 block 转 HTML 后是否也超长
+            block_html = gfm_to_html(block)
+            if len(block_html) <= limit:
+                cur_md = block
+                cur_html = block_html
+            else:
+                # 单块超长，按纯文本 4096 硬切（放弃 HTML 格式）
+                for i in range(0, len(block), limit):
+                    piece = block[i:i + limit]
+                    results.append((piece, piece))
+                cur_md = ""
+                cur_html = ""
+
+    if cur_html:
+        results.append((cur_html, cur_md))
+    return results
+
 async def send_reply(update, text, markdown=False):
-    """回复用户消息，自动分段。markdown=True 时做 GFM→HTML 渲染"""
+    """回复用户消息，自动分段。markdown=True 时确保每段 HTML 不超过 TG 限制"""
     if markdown:
-        html_text = gfm_to_html(text)
-        # 按原始文本分段，然后逐段转 HTML（避免切断 HTML 标签）
-        for i in range(0, len(text), 4000):
-            chunk = text[i:i + 4000]
-            html_chunk = gfm_to_html(chunk)
+        for html_chunk, raw_chunk in _split_html_chunks(text):
             try:
                 await update.message.reply_text(html_chunk, parse_mode="HTML")
             except Exception:
-                await update.message.reply_text(chunk)
+                await update.message.reply_text(raw_chunk)
     else:
         for i in range(0, len(text), 4096):
             await update.message.reply_text(text[i:i + 4096])
 
 async def send_to_topic(chat_id, topic_id, text, markdown=False):
-    """发送消息到指定话题，自动分段。markdown=True 时做 GFM→HTML 渲染"""
+    """发送消息到指定话题，自动分段。markdown=True 时确保每段 HTML 不超过 TG 限制"""
     if markdown:
-        for i in range(0, len(text), 4000):
-            chunk = text[i:i + 4000]
-            html_chunk = gfm_to_html(chunk)
+        for html_chunk, raw_chunk in _split_html_chunks(text):
             kwargs = {"chat_id": chat_id, "text": html_chunk}
             if topic_id:
                 kwargs["message_thread_id"] = topic_id
             try:
                 await tg_app.bot.send_message(**kwargs, parse_mode="HTML")
             except Exception:
-                kwargs["text"] = chunk
+                kwargs["text"] = raw_chunk
                 await tg_app.bot.send_message(**kwargs)
     else:
         for i in range(0, len(text), 4096):
@@ -896,6 +936,9 @@ async def cmd_quit(update: Update, context):
     session_id = session["session_id"]
     if session.get("watcher_task"):
         session["watcher_task"].cancel()
+    proc = session.get("proc")
+    if proc and proc.returncode is None:
+        proc.terminate()
     session_topics.pop(session_id, None)
     del sessions[topic_id]
     await update.message.reply_text(f"⏸️ 会话已暂停 ({session_id[:8]}...)\n用 /resume 可以恢复")
@@ -1052,7 +1095,6 @@ async def cmd_interrupt(update: Update, context):
             await update.message.reply_text("当前没有正在运行的 Claude 进程")
             return
         try:
-            import signal
             proc.send_signal(signal.SIGINT)
             await update.message.reply_text("✅ 已中断 Claude 回复")
         except Exception as e:
@@ -1143,6 +1185,21 @@ async def handle_message(update: Update, context):
         return
 
     # ========== TG 会话：启动 claude -p 进程 ==========
+
+    # 加锁防止同一话题并发启动多个 claude -p 进程
+    if topic_id not in topic_locks:
+        topic_locks[topic_id] = asyncio.Lock()
+    if topic_locks[topic_id].locked():
+        await update.message.reply_text("⏳ 上一条消息还在处理中，请稍候...")
+        return
+
+    async with topic_locks[topic_id]:
+        await _handle_tg_session(update, context, topic_id, session, text)
+
+
+async def _handle_tg_session(update, context, topic_id, session, text):
+    """TG 会话的实际处理逻辑（在 topic_lock 保护下执行）"""
+    user = update.effective_user
     print(f"[话题 {topic_id}] 用户: {user.first_name}, 目录: {session['project_dir']}, 内容: {text}")
 
     status_msg = await update.message.reply_text("⏳ 正在让 Claude 处理...")
@@ -1287,5 +1344,4 @@ async def main():
         print("已退出")
 
 if __name__ == "__main__":
-    import signal
     asyncio.run(main())
