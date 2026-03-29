@@ -3,6 +3,7 @@ import json
 import asyncio
 import signal
 import uuid
+import time
 import html as html_lib
 import mistune
 from aiohttp import web
@@ -158,6 +159,9 @@ session_topics = {}        # session_id → topic_id（反向映射）
 pending_permissions = {}   # 权限请求存储
 tmux_locks = {}            # tmux_pane → asyncio.Lock（防止并发注入交叉）
 topic_locks = {}           # topic_id → asyncio.Lock（防止 TG 会话并发启动多个 claude -p）
+BOT_START_TIME = time.time()  # Bot 启动时间戳
+message_count = 0          # 消息计数（收到的用户消息总数）
+conversation_count = 0     # 对话计数（启动过的 Claude 会话数）
 
 # ============ 工具函数 ============
 
@@ -611,6 +615,8 @@ async def handle_button(update: Update, context):
 
 async def http_session_start(request):
     """SessionStart hook: 终端会话开始，创建话题并启动监听"""
+    global conversation_count
+    conversation_count += 1
     if not GROUP_CHAT_ID:
         return web.json_response({"status": "no_group"})
     data = await request.json()
@@ -687,11 +693,13 @@ async def http_session_stop(request):
 
 async def http_permission(request):
     """Hook 脚本调用: 请求权限审批"""
-    if not permission_enabled:
+    data = await request.json()
+    force_approval = data.get("force_approval", False)
+    # 非敏感文件 + bypass 模式 = 直接放行
+    if not permission_enabled and not force_approval:
         return web.json_response({"decision": "allow"})
     if not (NOTIFY_CHAT_ID or GROUP_CHAT_ID):
         return web.json_response({"error": "请先在 Telegram 中发 /start"}, status=503)
-    data = await request.json()
     description = data.get("description", "未知操作")
     chat_id, thread_id = resolve_topic(data)
     if not chat_id:
@@ -758,7 +766,8 @@ async def cmd_start(update: Update, context):
         "/info - 查看会话信息\n"
         "/retry - 重发 Claude 最后一条回复\n"
         "/bypass - 切换权限审批\n"
-        "/setdir - 手动设置项目目录"
+        "/setdir - 手动设置项目目录\n"
+        "/status - 查看 Bot 运行状态"
     )
 
 async def cmd_bypass(update: Update, context):
@@ -1163,13 +1172,50 @@ async def cmd_retry(update: Update, context):
     else:
         await send_reply(update, text, markdown=True)
 
+async def cmd_status(update: Update, context):
+    """查看 Bot 运行状态：运行时长、会话数、消息数"""
+    if update.effective_user.id not in ALLOWED_USERS:
+        return
+    uptime = int(time.time() - BOT_START_TIME)
+    days = uptime // 86400
+    hours = (uptime % 86400) // 3600
+    mins = (uptime % 3600) // 60
+    secs = uptime % 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days}天")
+    if hours > 0:
+        parts.append(f"{hours}小时")
+    if mins > 0:
+        parts.append(f"{mins}分钟")
+    parts.append(f"{secs}秒")
+    uptime_str = " ".join(parts)
+
+    active_sessions = len([s for s in sessions.values() if s.get("session_id")])
+    terminal_sessions = len([s for s in sessions.values() if s.get("source") == "terminal"])
+    tg_sessions = len([s for s in sessions.values() if s.get("source") == "telegram"])
+    bypass_status = "关闭" if permission_enabled else "开启"
+
+    await update.message.reply_text(
+        f"📊 Claude Pilot 状态\n\n"
+        f"⏱ 运行时长: {uptime_str}\n"
+        f"💬 收到消息数: {message_count}\n"
+        f"🔄 启动对话数: {conversation_count}\n"
+        f"📡 当前活跃会话: {active_sessions}\n"
+        f"  ├ 终端会话: {terminal_sessions}\n"
+        f"  └ TG 会话: {tg_sessions}\n"
+        f"🔐 bypass: {bypass_status}"
+    )
+
 # ============ 消息处理（TG 会话 stream-json） ============
 
 async def handle_message(update: Update, context):
+    global message_count
     user = update.effective_user
     text = update.message.text
     if user.id not in ALLOWED_USERS:
         return
+    message_count += 1
     topic_id = get_topic_id(update)
     if topic_id not in sessions:
         sessions[topic_id] = {"session_id": None, "project_dir": DEFAULT_PROJECT_DIR}
@@ -1221,6 +1267,8 @@ async def handle_message(update: Update, context):
 
 async def _handle_tg_session(update, context, topic_id, session, text):
     """TG 会话的实际处理逻辑（在 topic_lock 保护下执行）"""
+    global conversation_count
+    conversation_count += 1
     user = update.effective_user
     print(f"[话题 {topic_id}] 用户: {user.first_name}, 目录: {session['project_dir']}, 内容: {text}")
 
@@ -1317,6 +1365,7 @@ async def main():
     tg_app.add_handler(CommandHandler("setdir", cmd_setdir))
     tg_app.add_handler(CommandHandler("info", cmd_info))
     tg_app.add_handler(CommandHandler("retry", cmd_retry))
+    tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CallbackQueryHandler(handle_button))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -1348,6 +1397,7 @@ async def main():
         BotCommand("retry", "重发 Claude 最后一条回复"),
         BotCommand("bypass", "切换权限审批"),
         BotCommand("setdir", "手动设置项目目录"),
+        BotCommand("status", "查看 Bot 运行状态"),
     ])
 
     await tg_app.updater.start_polling()

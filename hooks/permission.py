@@ -11,8 +11,67 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import read_bot_port
 
+import fnmatch
+import re
+
 BOT_PORT = read_bot_port()
 BOT_API = f"http://localhost:{BOT_PORT}/permission"
+
+# ============ 敏感文件保护规则 ============
+# 匹配这些模式的文件操作，无论 bypass 是否开启，都强制弹出审批
+SENSITIVE_PATTERNS = [
+    "*/.claude/*",
+    "*/.claude/**",
+    "**/.claude/*",
+    "**/.claude/**",
+    "**/settings.json",
+    "**/settings.local.json",
+    "**/settings.backup.json",
+    "**/.env",
+    "**/.env.*",
+]
+
+def is_sensitive_file(file_path):
+    """检查文件路径是否匹配敏感文件规则"""
+    if not file_path:
+        return False
+    # 展开 ~ 路径
+    file_path = os.path.expanduser(file_path)
+    # 直接检查是否包含 .claude/ 路径段
+    if "/.claude/" in file_path or file_path.endswith("/.claude"):
+        return True
+    # 检查文件名是否为 settings 相关
+    basename = os.path.basename(file_path)
+    if basename in ("settings.json", "settings.local.json", "settings.backup.json"):
+        return True
+    # 检查 .env 文件
+    if basename == ".env" or basename.startswith(".env."):
+        return True
+    # fnmatch 检查
+    for pattern in SENSITIVE_PATTERNS:
+        if fnmatch.fnmatch(file_path, pattern):
+            return True
+    return False
+
+def extract_file_paths(tool_name, tool_input):
+    """从工具调用中提取涉及的文件路径"""
+    paths = []
+    if tool_name in ("Edit", "Write", "Read"):
+        fp = tool_input.get("file_path", "")
+        if fp:
+            paths.append(fp)
+    elif tool_name == "Bash":
+        # 简单启发式：从命令中提取可能的文件路径
+        cmd = tool_input.get("command", "")
+        # 匹配包含 .claude 或 settings.json 的路径
+        for token in re.split(r'[\s;|&]+', cmd):
+            if ".claude" in token or "settings.json" in token or ".env" in token:
+                paths.append(token.strip("'\""))
+    elif tool_name == "Glob":
+        pattern = tool_input.get("path", "")
+        if pattern:
+            paths.append(pattern)
+    return paths
 
 # 从 stdin 读取 Claude 传来的 Hook 数据
 input_data = json.loads(sys.stdin.read())
@@ -32,6 +91,15 @@ elif tool_name == "Read":
 else:
     description = f"{tool_name}: {json.dumps(tool_input, ensure_ascii=False)[:200]}"
 
+# 检查是否涉及敏感文件
+force_approval = False
+file_paths = extract_file_paths(tool_name, tool_input)
+for fp in file_paths:
+    if is_sensitive_file(fp):
+        force_approval = True
+        description = f"⚠️ [敏感文件] {description}"
+        break
+
 # 读取环境变量（场景 A：由 bot 启动 Claude 时设置）
 chat_id = os.environ.get("TELEGRAM_CHAT_ID")
 thread_id = os.environ.get("TELEGRAM_THREAD_ID")
@@ -40,7 +108,11 @@ thread_id = os.environ.get("TELEGRAM_THREAD_ID")
 session_id = input_data.get("session_id", "")
 
 # 向 Bot 的 HTTP API 发请求，等待用户审批
-payload_data = {"description": description, "session_id": session_id}
+payload_data = {
+    "description": description,
+    "session_id": session_id,
+    "force_approval": force_approval,
+}
 if chat_id:
     payload_data["chat_id"] = int(chat_id)
 if thread_id:
